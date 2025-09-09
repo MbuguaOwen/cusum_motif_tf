@@ -46,31 +46,28 @@ def extract_event_windows(features: pd.DataFrame, events_df: pd.DataFrame, chann
     return seqs, labels
 
 def select_shapelets(seqs: List[np.ndarray], topk: int) -> List[np.ndarray]:
-    """Greedy medoid selection: pick the sequence minimizing sum distance; then farthest-from-selected, etc."""
+    """Greedy medoid selection with progress: build distance matrix then farthest-first coverage."""
     if len(seqs) == 0:
         return []
     n = len(seqs)
-    # Precompute distance matrix (can be big; keep simple)
-    D = np.zeros((n,n), dtype=float)
-    for i in range(n):
-        for j in range(i+1, n):
+    D = np.zeros((n, n), dtype=float)
+    for i in tqdm(range(n), desc="Mining: distance matrix", leave=False):
+        for j in range(i + 1, n):
             d = mv_distance(seqs[i], seqs[j])
-            D[i,j] = d; D[j,i] = d
+            D[i, j] = d; D[j, i] = d
     selected = []
-    # first medoid = argmin sum distances
     sums = D.sum(axis=1)
     idx = int(np.argmin(sums))
     selected.append(idx)
-    # farthest-first
-    while len(selected) < min(topk, n):
-        # score each candidate by min distance to selected -> choose the max (covering spread)
-        min_to_sel = np.min(D[:, selected], axis=1)
-        # avoid reselect
-        min_to_sel[selected] = -1
-        next_idx = int(np.argmax(min_to_sel))
-        if next_idx in selected:
-            break
-        selected.append(next_idx)
+    with tqdm(total=min(topk, n)-1, desc="Mining: select shapelets", leave=False) as pb:
+        while len(selected) < min(topk, n):
+            min_to_sel = np.min(D[:, selected], axis=1)
+            min_to_sel[selected] = -1
+            next_idx = int(np.argmax(min_to_sel))
+            if next_idx in selected:
+                break
+            selected.append(next_idx)
+            pb.update(1)
     return [seqs[i] for i in selected]
 
 def calibrate_epsilon(shapelet: np.ndarray, seqs_in_class: List[np.ndarray], q: float=0.15) -> float:

@@ -22,7 +22,7 @@ def compute_features(bars: pd.DataFrame, macro: int=60, micro: int=15, slope_M:i
     slopes = []
     r2s = []
     closes = df["log_close"].values
-    for i in range(len(df)):
+    for i in tqdm(range(len(df)), desc="Features: slope/R²", leave=False):
         j = i - slope_M + 1
         if j < 0:
             slopes.append(np.nan); r2s.append(np.nan); continue

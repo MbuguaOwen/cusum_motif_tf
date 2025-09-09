@@ -2,74 +2,115 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import numpy as np
 import pandas as pd
+import json, pickle
+from pathlib import Path
 
-@dataclass
-class Weights:
-    w: np.ndarray  # includes bias as last element
-    tau: float     # decision threshold
+def ridge_fit(X, y, lam: float = 1.0):
+    # Standardized ridge with bias term (no L2 on bias)
+    X = np.asarray(X, float); y = np.asarray(y, float)
+    mu, sigma = X.mean(0), X.std(0)
+    sigma[sigma == 0] = 1.0
+    Z = (X - mu) / sigma
+    Zb = np.c_[Z, np.ones(len(Z))]
+    I = np.eye(Zb.shape[1]); I[-1, -1] = 0.0
+    W = np.linalg.solve(Zb.T @ Zb + lam * I, Zb.T @ y)
+    return {"mu": mu, "sigma": sigma, "W": W}
 
-def mv_distance(a: np.ndarray, b: np.ndarray):
-    mu_a = a.mean(axis=1, keepdims=True); sd_a = a.std(axis=1, keepdims=True) + 1e-12
-    mu_b = b.mean(axis=1, keepdims=True); sd_b = b.std(axis=1, keepdims=True) + 1e-12
-    A = (a-mu_a)/sd_a; B = (b-mu_b)/sd_b
-    return float(np.sqrt(((A-B)**2).sum()))
+def ridge_apply(model: Dict[str, Any], X):
+    X = np.asarray(X, float)
+    Z = (X - model["mu"]) / model["sigma"]
+    Zb = np.c_[Z, np.ones(len(Z))]
+    return Zb @ model["W"]
 
-def hits_from_banks(window_seq: np.ndarray, banks_for_length: Dict[str, Any]):
-    good_hits = 0; bad_hits = 0; disc_hits = 0
-    for kind, bank in banks_for_length.items():
-        if kind not in ["GOOD", "BAD", "DISCORD"]: 
+def isotonic_fit(x, y):
+    # PAV for nondecreasing fit
+    x = np.asarray(x); y = np.asarray(y)
+    order = np.argsort(x); x, y = x[order], y[order]
+    y_hat = y.astype(float).copy()
+    n = len(y_hat); lvl = y_hat.copy(); w = np.ones(n)
+    i = 0
+    while i < n - 1:
+        if lvl[i] <= lvl[i + 1]:
+            i += 1; continue
+        j = i
+        while j >= 0 and lvl[j] > lvl[j + 1]:
+            wsum = w[j] + w[j + 1]
+            lvl[j] = lvl[j + 1] = (w[j] * lvl[j] + w[j + 1] * lvl[j + 1]) / wsum
+            w[j] = w[j + 1] = wsum
+            j -= 1
+        i += 1
+    # expand into a step function
+    return {"x": x, "lvl": lvl}
+
+def isotonic_apply(model: Dict[str, Any], xq):
+    x, lvl = model["x"], model["lvl"]
+    idx = np.searchsorted(x, xq, side="right") - 1
+    idx = np.clip(idx, 0, len(lvl) - 1)
+    return lvl[idx]
+
+ 
+
+
+def pick_tau_by_target(scores: np.ndarray,
+                       y: np.ndarray,
+                       months: np.ndarray,
+                       target_trades_per_month: float,
+                       min_precision: float,
+                       min_trades: int = 10) -> float:
+    """
+    Choose a decision threshold tau on TRAIN that aims for a target average trades/month
+    while meeting a minimum precision. If constraints cannot be met, fall back to a
+    quantile that yields at least `min_trades`.
+    """
+    if len(scores) == 0:
+        return float("+inf")
+    # group by month to estimate trades per month as we vary tau
+    uniq_months = np.unique(months)
+    if target_trades_per_month <= 0 or len(uniq_months) == 0:
+        # no target → default fallback: 80th percentile of scores or last value
+        k = max(min_trades, int(0.2 * len(scores)))
+        k = min(max(1, k), len(scores))
+        tau = float(np.sort(scores)[-k])
+        return tau
+
+    # sort descending by score
+    order = np.argsort(scores)[::-1]
+    scores_sorted = scores[order]
+    y_sorted = y[order]
+    m_sorted = months[order]
+
+    # scan thresholds at each unique score
+    best_tau = float("-inf")
+    best_gap = float("+inf")
+    for i in range(len(scores_sorted)):
+        tau = scores_sorted[i]
+        sel = scores >= tau
+        if not np.any(sel):
             continue
-        for sh in bank.shapelets:
-            d = mv_distance(window_seq, sh.series)
-            if d <= sh.epsilon:
-                if kind == "GOOD": good_hits += 1
-                elif kind == "BAD": bad_hits += 1
-                else: disc_hits += 1
-    return good_hits, bad_hits, disc_hits
+        # trades per month at this tau
+        trades_per_month = []
+        precision_numer = 0
+        precision_denom = 0
+        for m in uniq_months:
+            mask_m = sel & (months == m)
+            n_m = int(mask_m.sum())
+            if n_m > 0:
+                trades_per_month.append(n_m)
+                precision_numer += int((y[mask_m] > 0).sum())
+                precision_denom += n_m
+        avg_tpm = float(np.mean(trades_per_month)) if trades_per_month else 0.0
+        precision = (precision_numer / precision_denom) if precision_denom > 0 else 0.0
 
-def ridge_fit(X: np.ndarray, y: np.ndarray, lam: float=1.0) -> np.ndarray:
-    # closed-form ridge: (X'X + lam I)^-1 X'y
-    n, d = X.shape
-    I = np.eye(d)
-    A = X.T @ X + lam * I
-    b = X.T @ y
-    w = np.linalg.solve(A, b)
-    return w
+        if precision_denom >= min_trades and precision >= min_precision:
+            gap = abs(avg_tpm - target_trades_per_month)
+            if gap < best_gap:
+                best_gap = gap
+                best_tau = float(tau)
 
-def pick_tau(scores: np.ndarray, R: np.ndarray, min_trades:int=5):
-    # grid over score quantiles to maximize expected R with basic support
-    qs = np.linspace(0.1, 0.9, 17)
-    best_tau = np.percentile(scores, 50)
-    best_er = -1e9
-    for q in qs:
-        tau = np.percentile(scores, q*100)
-        mask = scores >= tau
-        if mask.sum() < min_trades:
-            continue
-        er = R[mask].mean()
-        if er > best_er:
-            best_er = er; best_tau = tau
-    return best_tau
+    if best_tau != float("-inf"):
+        return best_tau
 
-def build_train_weights(train_df: pd.DataFrame, lam: float=1.0) -> Weights:
-    # Features for weights: good_hits, -bad_hits, -disc_hits, accel, kappa_long, donch_pos, bias
-    cols = ["good_hits","neg_bad_hits","neg_disc_hits","accel","kappa_long","donch_pos"]
-    X = train_df[cols].fillna(0).values
-    X = np.c_[X, np.ones(len(X))]  # bias
-    y = train_df["realized_R"].values  # regress R directly
-    w = ridge_fit(X, y, lam=lam)
-    scores = X @ w
-    tau = pick_tau(scores, y, min_trades=max(5, int(0.2*len(y))))
-    return Weights(w=w, tau=tau)
-
-def score_row(row: pd.Series, w: np.ndarray) -> float:
-    x = np.array([
-        row.get("good_hits",0.0),
-        row.get("neg_bad_hits",0.0),
-        row.get("neg_disc_hits",0.0),
-        row.get("accel",0.0),
-        row.get("kappa_long",0.0),
-        row.get("donch_pos",0.0),
-        1.0
-    ], dtype=float)
-    return float(x @ w)
+    # Fallback: pick the smallest tau that yields at least min_trades overall
+    k = max(min_trades, int(0.2 * len(scores)))
+    k = min(max(1, k), len(scores))
+    return float(np.sort(scores)[-k])
