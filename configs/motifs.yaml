@@ -1,0 +1,82 @@
+# CUSUM‑Hybrid Motif TF — default config
+paths:
+  inputs_dir: "inputs"
+  outputs_dir: "outputs"
+
+symbols: ["BTCUSDT"]
+
+data:
+  months: ["2025-01", "2025-02", "2025-03", "2025-04","2025-05", "2025-06", "2025-07", "2025-08"]  # adjust
+  timezone: "UTC"
+
+features:
+  timeframe: "1m"
+  windows: { macro: 60, micro: 15, slope_M: 60 }
+  normalize: { zscore: true, percentiles: true }
+  channels: [kappa_long, kappa_short, accel, slope_r2, atr_p, bbw_p, donch_w_p, donch_pos, body_frac, wick_bias, re_burst, trend_age]
+
+cusum:
+  enabled: true
+  returns: "log"
+  drift_k: [0.0, "q50_abs_r"]
+  h_quantiles: [0.80, 0.85, 0.90]
+  sigma_window: 60
+  cooloff_bars: 45
+
+entry:
+  compression:
+    bbw_p_max: 20
+    donch_w_p_max: 20
+    atr_p_max: 30
+  trigger:
+    donch_break_buffer_atr: "q75_train"
+    body_frac_min: 0.6
+    accel_min: 1.5
+    donch_pos_min: 0.8
+  spacing_bars: 45
+  require_cusum: true
+
+label:
+  use_tick_first_touch: true
+  sl_mult: 8
+  tp_mult: 60
+  time_limit_bars: 1800
+  slippage_bps: 3
+  price_quantization: true
+
+mining:
+  horizons: [macro, micro]
+  lengths:
+    - {pre: 20, post: 40}
+    - {pre: 40, post: 80}
+  topk_per_class: 20
+  eps_percentile: 15
+  banks: [GOOD, BAD, DISCORD]
+
+scoring:
+  good_weight: 1.0
+  bad_weight: 1.5
+  discord_weight: 0.5
+  accel_weight: 0.5
+  kappa_weight: 0.3
+  donchpos_weight: 0.2
+  gate: { good_hits_min: 2, bad_hits_max: 0, lookback_hits_bars: 30 }
+  threshold_tau: "argmax_ER_under_constraints"
+  learn_weights: true
+  ridge_lambda: 1.0
+
+risk:
+  sl_mult: 8
+  tp_mult: 60
+  breakeven_progress: null       # keep null during discovery
+  trailing: "off"
+
+walkforward:
+  train_months: 3
+  test_months: 1
+  step_months: 1
+  select:
+    min_trades_per_month: 3
+    min_avg_R: 0.5
+    max_dd_R: 8
+    max_fold_dispersion: 0.6

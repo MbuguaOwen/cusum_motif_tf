@@ -1,0 +1,31 @@
+# Create .gitignore
+@"
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Envs & IDE
+.venv/
+venv/
+.env
+.vscode/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & artifacts
+inputs/
+outputs/
+*.parquet
+*.pkl
+*.zip
+"@ | Out-File -Encoding UTF8 .gitignore
+
+# Keep empty folders tracked with .gitkeep
+ni inputs\.gitkeep -Type File
+ni inputs\bars_1m\.gitkeep -Type File
+ni inputs\ticks\.gitkeep -Type File
+ni outputs\.gitkeep -Type File
