@@ -9,19 +9,30 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 def to_ms(ts):
-    # Accept ms int or ISO string -> ms int
+    # Accept seconds/ms/μs ints or ISO strings -> ms int
     if isinstance(ts, (int, np.integer, float, np.floating)):
-        return int(ts)
-    try:
-        return int(pd.to_datetime(ts, utc=True).value // 10**6)
-    except Exception:
-        return int(pd.to_datetime(ts, utc=True).value // 10**6)
+        n = int(ts)
+        if n > 10**14:   # microseconds
+            return n // 1000
+        if n > 10**12:   # milliseconds
+            return n
+        if n > 10**9:    # seconds
+            return n * 1000
+        return n
+    # strings / timestamps
+    dt = pd.to_datetime(ts, utc=True, errors="coerce")
+    if pd.isna(dt):
+        # last resort: treat as number
+        try:
+            return to_ms(float(ts))
+        except Exception:
+            raise ValueError(f"Cannot parse timestamp: {ts}")
+    return int(dt.value // 10**6)
 
 def rolling_percentile(s: pd.Series, window: int, q: float) -> pd.Series:
     return s.rolling(window, min_periods=window).quantile(q/100.0)
 
 def pct_rank(s: pd.Series, window: int) -> pd.Series:
-    # Percentile rank inside rolling window
     return s.rolling(window, min_periods=window).apply(lambda x: pd.Series(x).rank(pct=True).iloc[-1])
 
 def zscore(s: pd.Series, window: int) -> pd.Series:
@@ -42,10 +53,7 @@ def linear_regression_slope_r2(y: np.ndarray):
     return slope, r2
 
 def drawdown_R(rs: List[float]) -> float:
-    # worst cumulative sum drawdown in R
-    cum = 0.0
-    peak = 0.0
-    dd = 0.0
+    cum = 0.0; peak = 0.0; dd = 0.0
     for r in rs:
         cum += r
         peak = max(peak, cum)
@@ -71,7 +79,3 @@ def read_csv_or_parquet(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".parquet":
         return pd.read_parquet(path)
     return pd.read_csv(path)
-
-def quantize_price(price: float, step: Optional[float]) -> float:
-    if (step is None) or (step <= 0): return price
-    return round(price / step) * step
