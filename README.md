@@ -33,7 +33,7 @@ cusum_motif_tf/
 ## Quickstart
 1) Create & edit `configs/motifs.yaml` (see defaults).  
 2) Place your data into `inputs/bars_1m` and `inputs/ticks`.  
-3) Run the 7‑step pipeline via walk‑forward:
+3) Run the walk‑forward pipeline:
 
 ```bash
 # Windows PowerShell
@@ -50,7 +50,7 @@ python -m tfbrain --config configs/motifs.yaml --mode simulate
 ## Outputs (per symbol & fold under `outputs/`)
 - `candidates.parquet` — deterministic candidate entries & feature snapshots.
 - `events.parquet` — tick first‑touch labels (+1/−1/0), realized R, times to PT/SL.
-- `artifacts/*.pkl` — motif banks with ε calibration and metadata.
+- `artifacts/*` — per‑regime, per‑side motif banks and models.
 - `trades.csv` — simulated trades using frozen banks + risk.
 - `stats.json` — fold metrics (sum_R, avg_R, win_rate, median_R, max_dd_R, trades, etc.).
 
@@ -61,7 +61,7 @@ pandas
 pyyaml
 tqdm
 ```
-No scikit‑learn required; ridge weights are learned in‑house (NumPy).
+Both LONG and SHORT supported; regime_sign gate on by default. No scikit‑learn required; ridge weights are learned in‑house (NumPy).
 
 ## Notes
 - All thresholds are statistical (quantiles, t‑stats) and calibrated **on train only**.

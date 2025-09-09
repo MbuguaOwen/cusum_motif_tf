@@ -1,4 +1,4 @@
-# CUSUM‑Hybrid Motif TF — default config
+# CUSUM Hybrid Motif TF — default config
 paths:
   inputs_dir: "inputs"
   outputs_dir: "outputs"
@@ -6,14 +6,24 @@ paths:
 symbols: ["BTCUSDT"]
 
 data:
-  months: ["2025-01", "2025-02", "2025-03", "2025-04","2025-05", "2025-06", "2025-07", "2025-08"]  # adjust
+  months: ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05", "2025-06", "2025-07", "2025-08"]
   timezone: "UTC"
 
 features:
   timeframe: "1m"
-  windows: { macro: 60, micro: 15, slope_M: 60 }
+  windows: { macro: 60, micro: 30, slope_M: 60 }
   normalize: { zscore: true, percentiles: true }
-  channels: [kappa_long, kappa_short, accel, slope_r2, atr_p, bbw_p, donch_w_p, donch_pos, body_frac, wick_bias, re_burst, trend_age]
+  channels:
+    # Make sure these exist in features; keeps banks informative
+    - kappa_long
+    - accel
+    - donch_pos
+    - slope
+    - slope_r2
+    - bbw_p
+    - atr
+    - body_frac
+    - re_burst
 
 cusum:
   enabled: true
@@ -24,22 +34,31 @@ cusum:
   cooloff_bars: 45
 
 entry:
-  compression:
-    bbw_p_max: 20
-    donch_w_p_max: 20
-    atr_p_max: 30
-  trigger:
-    donch_break_buffer_atr: "q75_train"
-    body_frac_min: 0.6
-    accel_min: 1.5
-    donch_pos_min: 0.8
-  spacing_bars: 45
   require_cusum: true
+  cusum_tolerance_bars: 3         # a bit more forgiving around event-time
+
+  spacing_bars: 10                # allow more frequent candidates
+
+  compression:
+    bbw_p_max: 45                 # looser yet focused compression context
+    donch_w_p_max: 45
+    atr_p_max: 55
+
+  trigger:
+    body_frac_min: 0.22           # slightly looser bodies
+    accel_min: 0.00               # allow small positive accel
+    donch_pos_min: 0.45           # still biased to long-side compression break
+    breakout_atr_min: 0.10        # require close ≳ donch_high + 0.10*ATR (quality)
+
+  trend_guard:                    # quality filters to boost precision
+    kappa_long_min: 0.00
+    slope_r2_min: 0.15
+    re_burst_required: false
 
 label:
   use_tick_first_touch: true
-  sl_mult: 8
-  tp_mult: 60
+  sl_mult: 20.0
+  tp_mult: 60.0
   time_limit_bars: 1800
   slippage_bps: 3
   price_quantization: true
@@ -47,29 +66,39 @@ label:
 mining:
   horizons: [macro, micro]
   lengths:
-    - {pre: 20, post: 40}
-    - {pre: 40, post: 80}
-  topk_per_class: 20
-  eps_percentile: 15
+    - { pre: 20, post: 40 }
+    - { pre: 30, post: 60 }
+  topk_per_class: 12              # per-regime, a few more
+  eps_percentile: 15              # per-shapelet ε from in-class distances
   banks: [GOOD, BAD, DISCORD]
 
 scoring:
-  good_weight: 1.0
-  bad_weight: 1.5
-  discord_weight: 0.5
-  accel_weight: 0.5
-  kappa_weight: 0.3
-  donchpos_weight: 0.2
-  gate: { good_hits_min: 2, bad_hits_max: 0, lookback_hits_bars: 30 }
-  threshold_tau: "argmax_ER_under_constraints"
+  # training/learning
   learn_weights: true
   ridge_lambda: 1.0
 
+  gate:
+    # tighten and centralize gates
+    min_good_hits: 2
+    bad_to_good_max_ratio: 0.25
+    lookback_hits_bars: 30
+
+  # Train-only threshold selection (high-precision bias)
+  target_trades_per_month: 20
+  min_precision_train: 0.55
+  min_events_for_isotonic: 300
+  dump_train_test_scores: true    # writes scores_train.csv / scores_test.csv
+
+  # K-of-N consensus
+  k_of_n:
+    enabled: true
+    required: 2
+
 risk:
-  sl_mult: 8
-  tp_mult: 60
-  breakeven_progress: null       # keep null during discovery
-  trailing: "off"
+  atr_window: 50
+  tp_mult: 60.0
+  sl_mult: 20.0
+  timeout_bars: 1800
 
 walkforward:
   train_months: 3
@@ -80,3 +109,27 @@ walkforward:
     min_avg_R: 0.5
     max_dd_R: 8
     max_fold_dispersion: 0.6
+
+# Regime fingerprints (TRAIN-only learning)
+regime:
+  enabled: true
+  K: 8
+  features: [kappa_long, slope, slope_r2, atr_p, bbw_p, donch_w_p, trend_age]
+  assign: nearest_centroid
+  min_events_per_regime: 100
+  seed: 42
+
+# Sides & candidate detection (LONG+SHORT)
+sides:
+  allow_long: true
+  allow_short: true
+  regime_gate: "both"   # "sign" = long if κ>=+thr, short if κ<=-thr; "both" = allow both
+  kappa_sign_thr: 0.0   # sign gate threshold in κ units
+
+candidates:
+  donch_n: 20           # used for both sides
+  breakout_atr_buffer: 0.00
+  min_spacing_bars: 5
+  compression:
+    bbw_p_max: 0.60
+    donch_w_p_max: 0.80

@@ -91,33 +91,55 @@ def _normalize_tick_columns(df: pd.DataFrame) -> pd.DataFrame:
     lc = {c.lower(): c for c in df.columns}
     cols = {}
     # timestamp
-    for k in ["timestamp","ts","time"]: 
-        if k in lc: cols["timestamp"] = lc[k]; break
-    if "timestamp" not in cols: raise ValueError("Ticks file missing timestamp/ts/time")
+    for k in ["timestamp","ts","time"]:
+        if k in lc:
+            cols["timestamp"] = lc[k]
+            break
+    if "timestamp" not in cols:
+        raise ValueError("Ticks file missing timestamp/ts/time")
     # price
     for k in ["price","p","last_price"]:
-        if k in lc: cols["price"] = lc[k]; break
-    if "price" not in cols: raise ValueError("Ticks file missing price")
+        if k in lc:
+            cols["price"] = lc[k]
+            break
+    if "price" not in cols:
+        raise ValueError("Ticks file missing price")
     # qty
     for k in ["qty","quantity","size","amount","q"]:
-        if k in lc: cols["qty"] = lc[k]; break
-    if "qty" not in cols: cols["qty"] = None
+        if k in lc:
+            cols["qty"] = lc[k]
+            break
+    if "qty" not in cols:
+        cols["qty"] = None
     # maker flag
     for k in ["is_buyer_maker","isbuyer_maker","buyer_maker"]:
-        if k in lc: cols["is_buyer_maker"] = lc[k]; break
+        if k in lc:
+            cols["is_buyer_maker"] = lc[k]
+            break
 
-    out = pd.DataFrame()
+    # zero-copy mask + downcasts
     t = df[cols["timestamp"]]
-    # try ms first, fallback to parse
     try:
         t = pd.to_numeric(t, errors="coerce")
-        out["timestamp"] = t.apply(to_ms)
+        ts_ms = t.apply(to_ms)
     except Exception:
-        out["timestamp"] = pd.to_datetime(t, utc=True).view("int64") // 10**6
-    out["price"] = pd.to_numeric(df[cols["price"]], errors="coerce")
-    out["qty"] = pd.to_numeric(df[cols["qty"]], errors="coerce") if cols["qty"] else 0.0
-    out["is_buyer_maker"] = df[cols["is_buyer_maker"]].astype(int) if "is_buyer_maker" in cols else 0
-    return out[["timestamp","price","qty","is_buyer_maker"]].dropna(subset=["timestamp","price"])
+        ts_ms = pd.to_datetime(t, utc=True).astype("int64") // 10**6
+
+    price = pd.to_numeric(df[cols["price"]], errors="coerce")
+    qty   = pd.to_numeric(df[cols["qty"]], errors="coerce") if cols["qty"] else 0.0
+    ibm   = df[cols["is_buyer_maker"]].astype("uint8") if "is_buyer_maker" in cols else 0
+
+    mask = ts_ms.notna() & price.notna()
+    out = pd.DataFrame({
+        "timestamp": ts_ms[mask].astype("int64"),
+        "price":     price[mask].astype("float32"),
+        "qty":       (qty[mask].astype("float32") if not isinstance(qty, float) else
+                       pd.Series(qty, index=ts_ms.index)[mask].astype("float32")),
+        "is_buyer_maker": (ibm[mask] if hasattr(ibm, "reindex") else
+                            pd.Series(ibm, index=ts_ms.index)[mask]).astype("uint8"),
+    })
+    out = out.reset_index(drop=True)
+    return out
 
 def load_ticks(inputs_dir: Path, symbol: str, months: List[str]) -> pd.DataFrame:
     base = inputs_dir / "ticks"
@@ -129,9 +151,12 @@ def load_ticks(inputs_dir: Path, symbol: str, months: List[str]) -> pd.DataFrame
                 f"Ticks missing for {symbol} {m}. "
                 f"Looked for {symbol}_{{YYYY-MM}}.* or {symbol}-ticks-{{YYYY-MM}}.* under {base}."
             )
-        # ticks always csv in your sample
         df = pd.read_csv(fp)
         df = _normalize_tick_columns(df)
         rows.append(df)
-    out = pd.concat(rows, ignore_index=True).sort_values("timestamp")
+    # Concatenate without extra copies; months are chronological
+    out = pd.concat(rows, ignore_index=True, copy=False)
+    # If month files may overlap or be out-of-order, enable this guarded sort:
+    # if not out["timestamp"].is_monotonic_increasing:
+    #     out = out.sort_values("timestamp", kind="mergesort", ignore_index=True)
     return out

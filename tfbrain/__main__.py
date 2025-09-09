@@ -1,6 +1,7 @@
 import argparse, sys
 from pathlib import Path
 from .config import load_config
+import numpy as np, random
 from .walkforward import run_walkforward
 
 def main():
@@ -11,6 +12,13 @@ def main():
 
     cfg = load_config(args.config)
     root = Path(__file__).resolve().parents[1]
+    # Determinism
+    try:
+        seed = int(cfg.get("regime", {}).get("seed", 42))
+    except Exception:
+        seed = 42
+    np.random.seed(seed)
+    random.seed(seed)
     if args.mode == "walkforward":
         stats = run_walkforward(cfg, root)
         print(stats)
