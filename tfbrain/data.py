@@ -1,34 +1,43 @@
 from pathlib import Path
-from typing import List, Dict, Any
-import numpy as np
+from typing import List, Optional
 import pandas as pd
 from .utils import to_ms, read_csv_or_parquet
 
-def _find_month_file(base: Path, symbol: str, month: str):
-    # recursive patterns, prefer parquet if both exist
+def _find_month_file(base: Path, symbol: str, month: str, kind: str | None = None):
     cands = []
+    # Common patterns (bars & ticks)
     pats = [
         f"{symbol}_{month}.parquet", f"{symbol}_{month}.csv",
         f"{symbol}-{month}.parquet", f"{symbol}-{month}.csv",
         f"{symbol}-1m-{month}.parquet", f"{symbol}-1m-{month}.csv",
-        f"{symbol}-ticks-{month}.parquet", f"{symbol}-ticks-{month}.csv",
         f"**/{symbol}_{month}.parquet", f"**/{symbol}_{month}.csv",
         f"**/{symbol}-{month}.parquet", f"**/{symbol}-{month}.csv",
         f"**/{symbol}-1m-{month}.parquet", f"**/{symbol}-1m-{month}.csv",
-        f"**/{symbol}-ticks-{month}.parquet", f"**/{symbol}-ticks-{month}.csv",
     ]
-    for p in pats: cands.extend(base.glob(p))
+    # Extra patterns for ticks only (your current naming)
+    if (kind or "").lower() == "ticks":
+        pats += [
+            f"{symbol}-ticks-{month}.parquet",
+            f"{symbol}-ticks-{month}.csv",
+            f"**/{symbol}-ticks-{month}.parquet",
+            f"**/{symbol}-ticks-{month}.csv",
+            # common nested layout: inputs/ticks/<SYMBOL>/<SYMBOL>-ticks-YYYY-MM.csv
+            f"{symbol}/{symbol}-ticks-{month}.parquet",
+            f"{symbol}/{symbol}-ticks-{month}.csv",
+            f"**/{symbol}/{symbol}-ticks-{month}.parquet",
+            f"**/{symbol}/{symbol}-ticks-{month}.csv",
+        ]
+    for p in pats:
+        cands.extend(base.glob(p))
     cands = sorted(set(cands), key=lambda p: (p.suffix != ".parquet", str(p)))
     return cands[0] if cands else None
 
 def _read_bars_df(fp: Path) -> pd.DataFrame:
     if fp.suffix.lower() == ".csv":
         df = pd.read_csv(fp, header=0)
-        # Detect headerless by checking if first column name looks numeric
         first_col_name = str(df.columns[0])
-        if first_col_name.isdigit() or first_col_name.startswith("173") or df.shape[1] >= 6 and "timestamp" not in df.columns and "open_time" not in df.columns:
+        if first_col_name.isdigit() or df.shape[1] >= 6 and "timestamp" not in df.columns and "open_time" not in df.columns:
             df = pd.read_csv(fp, header=None)
-            # Binance kline 12 cols
             cols12 = ["open_time","open","high","low","close","volume",
                       "close_time","quote_volume","n_trades",
                       "taker_buy_base","taker_buy_quote","ignore"]
@@ -36,28 +45,19 @@ def _read_bars_df(fp: Path) -> pd.DataFrame:
             df.columns = cols12[:df.shape[1]]
     else:
         df = pd.read_parquet(fp)
-
-    # Normalize columns
     lc = {c.lower(): c for c in df.columns}
-    if "timestamp" in lc:
-        ts = df[lc["timestamp"]]
-    elif "open_time" in lc:
-        ts = df[lc["open_time"]]
+    if "timestamp" in lc: ts = df[lc["timestamp"]]
+    elif "open_time" in lc: ts = df[lc["open_time"]]
     elif df.index.name is not None:
-        df = df.reset_index()
-        ts = df[df.columns[0]]
+        df = df.reset_index(); ts = df[df.columns[0]]
     else:
         raise ValueError("Bars file missing a timestamp/open_time column")
-
-    # Build normalized frame
     out = pd.DataFrame()
     out["timestamp"] = ts.apply(to_ms)
-
     def pick(*names):
         for n in names:
             if n in lc: return df[lc[n]]
         return None
-
     for want, alts in {
         "open":  ["open","o","Open"],
         "high":  ["high","h","High"],
@@ -68,9 +68,49 @@ def _read_bars_df(fp: Path) -> pd.DataFrame:
         s = pick(*alts)
         if s is None: raise ValueError(f"Bars file missing required column: {want}")
         out[want] = pd.to_numeric(s, errors="coerce")
-
-    out = out.dropna(subset=["timestamp","open","high","low","close","volume"])
+    out = out.dropna(subset=["timestamp","open","high","low","close","volume"]
+                     )
     return out[["timestamp","open","high","low","close","volume"]]
+
+def _read_ticks_filtered_csv(fp: Path,
+                             min_ts: Optional[int],
+                             max_ts: Optional[int],
+                             chunksize: int = 2_000_000) -> pd.DataFrame:
+    """
+    Stream a tick CSV and return only two columns: timestamp (int64), price (float32),
+    filtered to [min_ts, max_ts] if provided.
+    """
+    # Discover column names (header-only read)
+    header = pd.read_csv(fp, nrows=0)
+    lc = {c.lower(): c for c in header.columns}
+    tcol = lc.get("timestamp") or lc.get("ts") or lc.get("time")
+    pcol = lc.get("price") or lc.get("p") or lc.get("last_price")
+    if tcol is None or pcol is None:
+        raise ValueError(f"{fp} missing required tick columns (timestamp/price)")
+
+    out_chunks = []
+    for chunk in pd.read_csv(fp, usecols=[tcol, pcol], chunksize=chunksize):
+        # Normalize column names and dtypes early
+        chunk = chunk.rename(columns={tcol: "timestamp", pcol: "price"})
+        chunk["timestamp"] = pd.to_numeric(chunk["timestamp"], errors="coerce")
+        chunk["price"] = pd.to_numeric(chunk["price"], errors="coerce")
+        # Drop bad rows before filtering
+        chunk = chunk.dropna(subset=["timestamp", "price"])
+        # Restrict to time window if given (keeps memory small)
+        if min_ts is not None:
+            chunk = chunk[chunk["timestamp"] >= min_ts]
+        if max_ts is not None:
+            chunk = chunk[chunk["timestamp"] <= max_ts]
+        if not chunk.empty:
+            # compact dtypes
+            chunk["timestamp"] = chunk["timestamp"].astype("int64")
+            chunk["price"] = chunk["price"].astype("float32")
+            out_chunks.append(chunk[["timestamp", "price"]])
+
+    if not out_chunks:
+        return pd.DataFrame(columns=["timestamp", "price"])
+    df = pd.concat(out_chunks, ignore_index=True)
+    return df.sort_values("timestamp")
 
 def load_bars_1m(inputs_dir: Path, symbol: str, months: List[str]) -> pd.DataFrame:
     base = inputs_dir / "bars_1m"
@@ -78,85 +118,65 @@ def load_bars_1m(inputs_dir: Path, symbol: str, months: List[str]) -> pd.DataFra
     for m in months:
         fp = _find_month_file(base, symbol, m)
         if fp is None:
-            raise FileNotFoundError(
-                f"Bars missing for {symbol} {m}. "
-                f"Looked for {symbol}_{{YYYY-MM}}.* or {symbol}-1m-{{YYYY-MM}}.* anywhere under {base}."
-            )
+            raise FileNotFoundError(f"Bars missing for {symbol} {m} under {base}")
         df = _read_bars_df(fp)
         rows.append(df)
     out = pd.concat(rows, ignore_index=True).sort_values("timestamp")
     return out
 
-def _normalize_tick_columns(df: pd.DataFrame) -> pd.DataFrame:
-    lc = {c.lower(): c for c in df.columns}
-    cols = {}
-    # timestamp
-    for k in ["timestamp","ts","time"]:
-        if k in lc:
-            cols["timestamp"] = lc[k]
-            break
-    if "timestamp" not in cols:
-        raise ValueError("Ticks file missing timestamp/ts/time")
-    # price
-    for k in ["price","p","last_price"]:
-        if k in lc:
-            cols["price"] = lc[k]
-            break
-    if "price" not in cols:
-        raise ValueError("Ticks file missing price")
-    # qty
-    for k in ["qty","quantity","size","amount","q"]:
-        if k in lc:
-            cols["qty"] = lc[k]
-            break
-    if "qty" not in cols:
-        cols["qty"] = None
-    # maker flag
-    for k in ["is_buyer_maker","isbuyer_maker","buyer_maker"]:
-        if k in lc:
-            cols["is_buyer_maker"] = lc[k]
-            break
-
-    # zero-copy mask + downcasts
-    t = df[cols["timestamp"]]
-    try:
-        t = pd.to_numeric(t, errors="coerce")
-        ts_ms = t.apply(to_ms)
-    except Exception:
-        ts_ms = pd.to_datetime(t, utc=True).astype("int64") // 10**6
-
-    price = pd.to_numeric(df[cols["price"]], errors="coerce")
-    qty   = pd.to_numeric(df[cols["qty"]], errors="coerce") if cols["qty"] else 0.0
-    ibm   = df[cols["is_buyer_maker"]].astype("uint8") if "is_buyer_maker" in cols else 0
-
-    mask = ts_ms.notna() & price.notna()
-    out = pd.DataFrame({
-        "timestamp": ts_ms[mask].astype("int64"),
-        "price":     price[mask].astype("float32"),
-        "qty":       (qty[mask].astype("float32") if not isinstance(qty, float) else
-                       pd.Series(qty, index=ts_ms.index)[mask].astype("float32")),
-        "is_buyer_maker": (ibm[mask] if hasattr(ibm, "reindex") else
-                            pd.Series(ibm, index=ts_ms.index)[mask]).astype("uint8"),
-    })
-    out = out.reset_index(drop=True)
-    return out
-
-def load_ticks(inputs_dir: Path, symbol: str, months: List[str]) -> pd.DataFrame:
+def load_ticks(inputs_dir: Path,
+               symbol: str,
+               months: List[str],
+               min_ts: Optional[int] = None,
+               max_ts: Optional[int] = None,
+               chunksize: int = 2_000_000) -> pd.DataFrame:
+    """
+    Load ticks for the given months, streamed (CSV) and filtered by [min_ts, max_ts].
+    Returns only ['timestamp','price'] to minimize memory for labeling.
+    """
     base = inputs_dir / "ticks"
     rows = []
     for m in months:
-        fp = _find_month_file(base, symbol, m)
+        fp = _find_month_file(base, symbol, m, kind="ticks")
         if fp is None:
+            examples = [
+                f"{symbol}-{m}.csv",
+                f"{symbol}_{m}.csv",
+                f"{symbol}-1m-{m}.csv",
+                f"{symbol}-ticks-{m}.csv",
+                f"{symbol}/{symbol}-ticks-{m}.csv",
+            ]
             raise FileNotFoundError(
-                f"Ticks missing for {symbol} {m}. "
-                f"Looked for {symbol}_{{YYYY-MM}}.* or {symbol}-ticks-{{YYYY-MM}}.* under {base}."
+                f"Ticks missing for {symbol} {m} under {base}\n"
+                f"Tried patterns like: {', '.join(examples)}"
             )
-        df = pd.read_csv(fp)
-        df = _normalize_tick_columns(df)
-        rows.append(df)
-    # Concatenate without extra copies; months are chronological
-    out = pd.concat(rows, ignore_index=True, copy=False)
-    # If month files may overlap or be out-of-order, enable this guarded sort:
-    # if not out["timestamp"].is_monotonic_increasing:
-    #     out = out.sort_values("timestamp", kind="mergesort", ignore_index=True)
-    return out
+
+        if fp.suffix.lower() == ".parquet":
+            # If parquet exists, select needed cols then filter
+            df = pd.read_parquet(fp)
+            lc = {c.lower(): c for c in df.columns}
+            tcol = lc.get("timestamp") or lc.get("ts") or lc.get("time")
+            pcol = lc.get("price") or lc.get("p") or lc.get("last_price")
+            if tcol is None or pcol is None:
+                raise ValueError(f"{fp} missing required tick columns (timestamp/price)")
+            df = df.rename(columns={tcol: "timestamp", pcol: "price"})[["timestamp", "price"]]
+            df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            df = df.dropna(subset=["timestamp", "price"])
+            if min_ts is not None:
+                df = df[df["timestamp"] >= min_ts]
+            if max_ts is not None:
+                df = df[df["timestamp"] <= max_ts]
+            df["timestamp"] = df["timestamp"].astype("int64")
+            df["price"] = df["price"].astype("float32")
+        else:
+            # Stream CSV
+            df = _read_ticks_filtered_csv(fp, min_ts=min_ts, max_ts=max_ts, chunksize=chunksize)
+
+        if not df.empty:
+            rows.append(df)
+
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "price"])
+    out = pd.concat(rows, ignore_index=True).sort_values("timestamp")
+    return out[["timestamp", "price"]]
