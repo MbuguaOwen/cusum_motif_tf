@@ -31,6 +31,8 @@ def compute_min_dists(features: pd.DataFrame, banks: Dict[str,Any], bar_idx: int
                     else:
                         bad_min = min(bad_min, d)
                         if d <= sh.epsilon * eps_mult: bad_hits += 1
+        # we've processed the matching regime; no need to scan others
+        break
     return good_min, bad_min, good_hits, bad_hits
 
 def train_gates_on_fold(features: pd.DataFrame,
@@ -42,7 +44,9 @@ def train_gates_on_fold(features: pd.DataFrame,
     gs = cfg["gating_search"]
     eps_list = gs["eps_multiplier"]
     K_list   = gs["K_hits"]
-    L_list   = gs["lookback_L"]
+    L_list   = gs.get("lookback_L", [0])
+    # NOTE: lookback_L is currently a compatibility placeholder (no rolling K-of-N aggregation yet).
+    # Gating uses single-bar motif hits. Keep config key for forward-compatibility.
     M_list   = gs["bad_margin"]
     Bbuf     = gs["breakout_buffer_atr"]
     lam      = gs.get("ridge_lambda", 1.0)
@@ -94,7 +98,11 @@ def train_gates_on_fold(features: pd.DataFrame,
                             ((df["bad_min"] - df["good_min"]) >= dm) &
                             (df["breakout_ok_"+str(bb)].astype(bool))
                         )
-                        if df["fire_rule"].sum() < max(5, int(gs["min_trades_per_month"])):
+                        min_tr_pm = int(gs.get("min_trades_per_month", 3))
+                        # Estimate train-month count from the training table itself
+                        train_months_count = int(df[df.get("is_train", True)]["month"].nunique()) if "month" in df.columns else 1
+                        min_rows = max(3, min_tr_pm * max(1, train_months_count))
+                        if df["fire_rule"].sum() < min_rows:
                             continue
                         X = df.loc[df["fire_rule"], ["LLR_sum","accel","kappa_long","donch_pos","ctx_sim"]].values
                         y = df.loc[df["fire_rule"], "realized_R"].values
@@ -106,7 +114,10 @@ def train_gates_on_fold(features: pd.DataFrame,
                         for tau in taus:
                             mask = df["fire_rule"] & (df["S"] >= tau)
                             n = int(mask.sum())
-                            if n < max(5, int(gs["min_trades_per_month"])):
+                            min_tr_pm = int(gs.get("min_trades_per_month", 3))
+                            train_months_count = int(df[df.get("is_train", True)]["month"].nunique()) if "month" in df.columns else 1
+                            min_rows = max(3, min_tr_pm * max(1, train_months_count))
+                            if n < min_rows:
                                 continue
                             R = df.loc[mask, "realized_R"].values.tolist()
                             if len(R)==0: continue
@@ -125,10 +136,10 @@ def train_gates_on_fold(features: pd.DataFrame,
                         if (best is None) or (candidate["er"] > best["er"]):
                             best = candidate
     if best is None:
-        best = {
-            "eps_mult": 1.0, "K": 2, "L": 30, "bad_margin": 0.2, "breakout_buffer_atr": 0.5,
-            "tau": 0.0, "er": 0.0, "w": [1.0, 0.0, 0.0, 0.0, 1.0, 1.0], "coverage": 0
-        }
+        raise RuntimeError(
+            "Gating search found no valid configuration (too strict thresholds or insufficient fire_rule rows). "
+            "Loosen eps_multiplier/K_hits/bad_margin or widen candidate compression thresholds."
+        )
     return best
 
 def prepare_training_table(features: pd.DataFrame,
@@ -145,7 +156,25 @@ def prepare_training_table(features: pd.DataFrame,
     gamma = float(regime_ctx.get("gamma", 1.0))
     centers_z = np.array(regime_ctx["centers_z"], dtype=float)
 
-    ev = events.merge(candidates[["bar_idx","side","donch_high","donch_low","atr","close"]], on="bar_idx", how="left")
+    ev = events.merge(
+        candidates[["bar_idx","side","donch_high","donch_low","atr","close"]],
+        on="bar_idx",
+        how="left",
+        suffixes=("", "_cand")
+    )
+    # unify side column (events.side vs candidates.side)
+    if "side" not in ev.columns:
+        if "side_cand" in ev.columns:
+            ev["side"] = ev["side_cand"]
+        elif "side_x" in ev.columns:
+            ev["side"] = ev["side_x"]
+        elif "side_y" in ev.columns:
+            ev["side"] = ev["side_y"]
+    # optional tidy-up (don’t fail if they’re absent)
+    for col in ("side_cand","side_x","side_y"):
+        if col in ev.columns:
+            try: ev.drop(columns=[col], inplace=True)
+            except Exception: pass
     ev["regime_id"] = regimes["regime_id"].reindex(ev["bar_idx"].values).values
     rows=[]
     epsm = cfg["gating_search"]["eps_multiplier"][0]

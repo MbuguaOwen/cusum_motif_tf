@@ -1,36 +1,37 @@
 from pathlib import Path
 from typing import List, Optional
+import re
 import pandas as pd
 from .utils import to_ms, read_csv_or_parquet
+from .preflight import RE_BAR, RE_TICK
 
-def _find_month_file(base: Path, symbol: str, month: str, kind: str | None = None):
-    cands = []
-    # Common patterns (bars & ticks)
-    pats = [
-        f"{symbol}_{month}.parquet", f"{symbol}_{month}.csv",
-        f"{symbol}-{month}.parquet", f"{symbol}-{month}.csv",
-        f"{symbol}-1m-{month}.parquet", f"{symbol}-1m-{month}.csv",
-        f"**/{symbol}_{month}.parquet", f"**/{symbol}_{month}.csv",
-        f"**/{symbol}-{month}.parquet", f"**/{symbol}-{month}.csv",
-        f"**/{symbol}-1m-{month}.parquet", f"**/{symbol}-1m-{month}.csv",
-    ]
-    # Extra patterns for ticks only (your current naming)
-    if (kind or "").lower() == "ticks":
-        pats += [
-            f"{symbol}-ticks-{month}.parquet",
-            f"{symbol}-ticks-{month}.csv",
-            f"**/{symbol}-ticks-{month}.parquet",
-            f"**/{symbol}-ticks-{month}.csv",
-            # common nested layout: inputs/ticks/<SYMBOL>/<SYMBOL>-ticks-YYYY-MM.csv
-            f"{symbol}/{symbol}-ticks-{month}.parquet",
-            f"{symbol}/{symbol}-ticks-{month}.csv",
-            f"**/{symbol}/{symbol}-ticks-{month}.parquet",
-            f"**/{symbol}/{symbol}-ticks-{month}.csv",
-        ]
-    for p in pats:
-        cands.extend(base.glob(p))
-    cands = sorted(set(cands), key=lambda p: (p.suffix != ".parquet", str(p)))
-    return cands[0] if cands else None
+def _glob_like(dirpath: Path, patterns: list[str]) -> list[Path]:
+    if not dirpath.exists():
+        return []
+    found = []
+    for p in dirpath.rglob("*"):
+        name = p.name.lower()
+        for pat in patterns:
+            if re.fullmatch(pat, name):
+                found.append(p)
+                break
+    return found
+
+def _search_patterns(base: Path, symbol: str, month: str, kind: str) -> Optional[Path]:
+    sym = symbol.lower(); ym = month.lower()
+    patterns = RE_BAR if kind.lower() == "bars" else RE_TICK
+    pats = [pat.format(sym=sym, ym=ym) for pat in patterns]
+    # Prefer matches directly under symbol folder, then under base
+    paths = _glob_like(base / symbol, pats)
+    if not paths:
+        paths = _glob_like(base, pats)
+    if not paths:
+        return None
+    # Prefer parquet over csv, and prefer more specific patterns earlier in RE_BAR/RE_TICK ordering
+    def score(p: Path) -> tuple[int, str]:
+        return (0 if p.suffix.lower() == ".parquet" else 1, str(p))
+    paths = sorted(paths, key=score)
+    return paths[0]
 
 def _read_bars_df(fp: Path) -> pd.DataFrame:
     if fp.suffix.lower() == ".csv":
@@ -109,16 +110,24 @@ def _read_ticks_filtered_csv(fp: Path,
 
     if not out_chunks:
         return pd.DataFrame(columns=["timestamp", "price"])
+    # Assume files are already time-ordered; avoid global sort to save RAM
     df = pd.concat(out_chunks, ignore_index=True)
-    return df.sort_values("timestamp")
+    return df
 
 def load_bars_1m(inputs_dir: Path, symbol: str, months: List[str]) -> pd.DataFrame:
     base = inputs_dir / "bars_1m"
     rows = []
     for m in months:
-        fp = _find_month_file(base, symbol, m)
+        fp = _search_patterns(base, symbol, m, kind="bars")
         if fp is None:
-            raise FileNotFoundError(f"Bars missing for {symbol} {m} under {base}")
+            examples = [
+                f"{symbol}-1m-{m}.parquet", f"{symbol}-1m-{m}.csv",
+                f"{symbol}-{m}.parquet", f"{symbol}-{m}.csv",
+            ]
+            raise FileNotFoundError(
+                f"No bars file found for {symbol} {m}. Looked under {base} with patterns derived from {RE_BAR}. "
+                f"Example accepted names: {', '.join(examples)}"
+            )
         df = _read_bars_df(fp)
         rows.append(df)
     out = pd.concat(rows, ignore_index=True).sort_values("timestamp")
@@ -137,18 +146,16 @@ def load_ticks(inputs_dir: Path,
     base = inputs_dir / "ticks"
     rows = []
     for m in months:
-        fp = _find_month_file(base, symbol, m, kind="ticks")
+        fp = _search_patterns(base, symbol, m, kind="ticks")
         if fp is None:
             examples = [
-                f"{symbol}-{m}.csv",
-                f"{symbol}_{m}.csv",
-                f"{symbol}-1m-{m}.csv",
-                f"{symbol}-ticks-{m}.csv",
-                f"{symbol}/{symbol}-ticks-{m}.csv",
+                f"{symbol}-ticks-{m}.parquet", f"{symbol}-ticks-{m}.csv",
+                f"{symbol}-{m}.parquet", f"{symbol}-{m}.csv",
+                f"{symbol}_{m}.parquet", f"{symbol}_{m}.csv",
             ]
             raise FileNotFoundError(
-                f"Ticks missing for {symbol} {m} under {base}\n"
-                f"Tried patterns like: {', '.join(examples)}"
+                f"No ticks file found for {symbol} {m}. Looked under {base} with patterns derived from {RE_TICK}. "
+                f"Example accepted names: {', '.join(examples)}"
             )
 
         if fp.suffix.lower() == ".parquet":
@@ -178,5 +185,6 @@ def load_ticks(inputs_dir: Path,
 
     if not rows:
         return pd.DataFrame(columns=["timestamp", "price"])
-    out = pd.concat(rows, ignore_index=True).sort_values("timestamp")
+    # Concatenate in month order; avoid sort to prevent large RAM spikes
+    out = pd.concat(rows, ignore_index=True)
     return out[["timestamp", "price"]]

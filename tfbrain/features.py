@@ -71,4 +71,18 @@ def compute_features(bars: pd.DataFrame, macro: int=60, micro: int=15, slope_M:i
             last_flip += 1
         age.append(last_flip)
     df["trend_age"] = age
+
+    # Attach feature channel names for diagnostics (non-breaking; still return DataFrame)
+    produced = [
+        "kappa_long","kappa_short","accel","slope","slope_r2","atr",
+        "atr_p","bbw_p","donch_w_p","donch_pos","body_frac","wick_bias",
+        "re_burst","trend_age"
+    ]
+    df.attrs["feature_channels_lower"] = [c.lower() for c in produced if c in df.columns]
     return df
+
+def assert_channels_exist(df: pd.DataFrame, channels: list[str]):
+    cols = {c.lower() for c in df.columns}
+    need = [c for c in channels if c.lower() not in cols]
+    if need:
+        raise KeyError(f"Missing feature channels: {need}. Present: {sorted(list(cols))}")

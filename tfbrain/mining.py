@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -68,7 +68,61 @@ def ppv(seqs_g: List[np.ndarray], seqs_b: List[np.ndarray], sh: np.ndarray, eps:
     denom = hits_g + hits_b
     return (hits_g/denom) if denom>0 else 0.0
 
-def build_banks_per_regime(features: pd.DataFrame, events: pd.DataFrame, channels: List[str], lengths: List[Dict[str,int]], topk_per_class:int, eps_percentile: float, regime_ids, ppv_prune: float, meta: Dict[str,Any]):
+def build_banks_per_regime(features: pd.DataFrame,
+                           events: pd.DataFrame,
+                           channels: List[str],
+                           lengths: List[Dict[str,int]],
+                           topk_per_class: int,
+                           eps_percentile: float,
+                           regime_ids,
+                           ppv_prune: float,
+                           meta: Dict[str,Any],
+                           max_events_per_fold: Optional[int] = None):
+    # Safety cap for event counts to avoid runaway compute
+    events_n = len(events)
+    max_events = int(max_events_per_fold) if max_events_per_fold is not None else 25000
+    if events_n > max_events and events_n > 0:
+        try:
+            from math import floor
+            f = max_events / float(events_n)
+            grp = events.groupby(["label", "month"], dropna=False)
+            counts = grp.size()
+            target = (counts * f).apply(lambda x: int(floor(x)))
+            # Ensure we don't drop all from any non-empty group
+            target = target.where(counts == 0, target.clip(lower=1))
+            # Adjust to exact budget by allocating leftovers by largest fractional part
+            frac = (counts * f) - target
+            need = max_events - int(target.sum())
+            if need > 0:
+                order = frac.sort_values(ascending=False)
+                for idx in order.index[:need]:
+                    target[idx] = int(target[idx]) + 1
+            elif need < 0:
+                # Too many selected due to min-1 constraint; remove from groups with smallest fractional part
+                order = frac.sort_values(ascending=True)
+                for idx in order.index:
+                    if need == 0:
+                        break
+                    if target[idx] > 0:
+                        target[idx] = int(target[idx]) - 1
+                        need += 1
+
+            parts = []
+            for key, tcnt in target.items():
+                if tcnt <= 0:
+                    continue
+                gdf = grp.get_group(key)
+                if len(gdf) <= tcnt:
+                    parts.append(gdf)
+                else:
+                    parts.append(gdf.sample(n=int(tcnt), random_state=42, replace=False))
+            events = pd.concat(parts, ignore_index=True) if parts else events.head(0)
+            tqdm.write(f"[mining] Capping events from {events_n} → {max_events} for compute safety (configurable).")
+        except Exception:
+            # Fallback: simple uniform sample if stratification failed
+            events = events.sample(n=max_events, random_state=42, replace=False)
+            tqdm.write(f"[mining] Capping events from {events_n} → {max_events} (uniform fallback).")
+
     banks = {}
     for reg in sorted(pd.unique(regime_ids)):
         ev_reg = events[events["regime_id"]==reg]

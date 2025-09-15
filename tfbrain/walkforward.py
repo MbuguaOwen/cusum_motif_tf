@@ -7,7 +7,7 @@ import pickle
 import json
 from .config import load_config
 from .data import load_bars_1m, load_ticks
-from .features import compute_features
+from .features import compute_features, assert_channels_exist
 from .cusum import cusum_events
 from .regime import fingerprint, kmeans_fit, assign_kmeans
 from .candidates import detect_candidates
@@ -46,7 +46,10 @@ def run_walkforward(cfg: Dict[str, Any], root: Path):
         bars = load_bars_1m(inputs, symbol, train_m + test_m); step.update(1)
 
         step.set_postfix_str("features")
-        feats = compute_features(bars, macro=cfg["features"]["windows"]["macro"], micro=cfg["features"]["windows"]["micro"], slope_M=cfg["features"]["windows"]["slope_M"]); step.update(1)
+        feats = compute_features(bars, macro=cfg["features"]["windows"]["macro"], micro=cfg["features"]["windows"]["micro"], slope_M=cfg["features"]["windows"]["slope_M"])
+        # Validate required feature channels early (fail fast)
+        assert_channels_exist(feats, cfg["features"]["channels"]) 
+        step.update(1)
 
         step.set_postfix_str("CUSUM")
         rr = np.log(bars["close"]).diff().fillna(0.0).values
@@ -62,7 +65,16 @@ def run_walkforward(cfg: Dict[str, Any], root: Path):
         fp = fingerprint(feats, cusum_df, cfg)
         bars["month"] = pd.to_datetime(bars["timestamp"], unit="ms", utc=True).dt.strftime("%Y-%m")
         train_mask = bars["month"].isin(train_m)
-        centers, _labels = kmeans_fit(fp[train_mask].values, k=int(cfg["regime"]["k"]), iters=50, seed=42)
+        # K-means safety: guard k against small training set
+        fp_train = fp[train_mask].values
+        k_cfg = int(cfg.get("regime", {}).get("k", 6))
+        n_train = len(fp_train)
+        if n_train < 1:
+            raise RuntimeError("Regime clustering: no training fingerprints available; check candidate/feature generation.")
+        if n_train < k_cfg:
+            tqdm.write(f"[regime] Reducing k from {k_cfg} -> {n_train} (train fingerprints too few).")
+            k_cfg = n_train
+        centers, _labels = kmeans_fit(fp_train, k=k_cfg, iters=50, seed=42)
         reg_ids = assign_kmeans(fp.values, centers)
         regimes = pd.DataFrame({"regime_id": reg_ids}, index=feats.index)
         regimes.to_csv(fold_dir/"regimes.csv", index=False)
@@ -106,7 +118,18 @@ def run_walkforward(cfg: Dict[str, Any], root: Path):
         events["month"] = pd.to_datetime(events["timestamp"], unit="ms", utc=True).dt.strftime("%Y-%m")
         ev_train = events[events["month"].isin(train_m)].copy()
         ev_train["regime_id"] = regimes["regime_id"].reindex(ev_train["bar_idx"].values).values
-        banks = build_banks_per_regime(feats, ev_train, cfg["features"]["channels"], cfg["mining"]["lengths"], cfg["mining"]["topk_per_class"], cfg["mining"]["eps_percentile"], ev_train["regime_id"].values, cfg["gating_search"]["ppv_prune"], meta={"symbol":symbol, "train_months":train_m})
+        banks = build_banks_per_regime(
+            feats,
+            ev_train,
+            cfg["features"]["channels"],
+            cfg["mining"]["lengths"],
+            cfg["mining"]["topk_per_class"],
+            cfg["mining"]["eps_percentile"],
+            ev_train["regime_id"].values,
+            cfg.get("mining", {}).get("ppv_prune", cfg.get("gating_search", {}).get("ppv_prune", 0.5)),
+            meta={"symbol": symbol, "train_months": train_m},
+            max_events_per_fold=int(cfg.get("mining", {}).get("max_events_per_fold", 25000))
+        )
         import pickle
         art_dir = fold_dir/"artifacts"; ensure_dir(art_dir)
         with open(art_dir/"banks.pkl","wb") as f: pickle.dump(banks, f)
@@ -137,8 +160,20 @@ def run_walkforward(cfg: Dict[str, Any], root: Path):
         step.update(1)
 
         step.set_postfix_str("simulate")
-        stats = simulate_with_gates(symbol, feats, cands, events, banks, regimes, gating, cfg["features"]["channels"], fold_dir, fp_z=fp_z, regime_ctx=regime_ctx)
+        # Restrict to test-only events for honest OOS evaluation
+        if "month" not in events.columns:
+            # derive if needed (YYYY-MM from timestamp)
+            events["month"] = pd.to_datetime(events["timestamp"], unit="ms", utc=True).dt.strftime("%Y-%m")
+        events_test = events[events["month"].isin(test_m)].copy()
+
+        stats = simulate_with_gates(symbol, feats, cands, events_test, banks, regimes, gating, cfg["features"]["channels"], fold_dir, fp_z=fp_z, regime_ctx=regime_ctx)
         json_dump(stats, fold_dir/"stats.json"); step.update(1); step.close()
+
+        # Friendly summary per fold
+        trades_n = stats.get("n_trades", stats.get("trades"))
+        print(f"[fold {fi}] trades={trades_n} avg_R={stats.get('avg_R')} win_rate={stats.get('win_rate')} file={fold_dir/'stats.json'}")
+        if not trades_n:
+            print("Tip: 0 trades in TEST. Consider loosening gating (eps_multiplier ↑, K_hits ↓, bad_margin ↓, breakout_buffer_atr ↓) or loosening candidate compression/spacing. (Simulation uses test-only events.)")
 
         all_stats.append({"fold": fi, **stats, "train_months": train_m, "test_months": test_m})
 

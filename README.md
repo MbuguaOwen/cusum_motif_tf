@@ -294,3 +294,12 @@ This is **research tooling**. No broker/exchange execution, no financial advice.
 ---
 
 **Build it like a pro:** start tight (few months), confirm the bank/gates make sense, then extend months/symbols. Keep your eye on **E[R]**, **PPV**, and **DD in R**. Memory is power; selection is edge.
+
+### Preflight (sanity checks)
+Run before a long job:
+`python -m tfbrain --config configs/motifs.yaml --mode preflight`
+
+### Full walk-forward (uses the same preflight automatically)
+`python -m tfbrain --config configs/motifs.yaml --mode walkforward`
+
+Note: Simulation now evaluates test-only events per fold (no training events included), ensuring honest out-of-sample evaluation.

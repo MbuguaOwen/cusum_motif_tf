@@ -13,6 +13,11 @@ def _seq(features, channels, start, end):
     return seg
 
 def simulate_with_gates(symbol: str, features: pd.DataFrame, candidates: pd.DataFrame, events: pd.DataFrame, banks: Dict[str,Any], regimes: pd.DataFrame, gating: Dict[str,Any], channels: list, out_dir: Path, fp_z, regime_ctx: Dict[str,Any]) -> Dict[str,Any]:
+    # Ensure we're simulating test-only; 'month' should exist and be pre-filtered upstream.
+    if "month" not in events.columns:
+        # derive month for safety (won't hurt if already filtered)
+        events = events.copy()
+        events["month"] = pd.to_datetime(events["timestamp"], unit="ms", utc=True).dt.strftime("%Y-%m")
     epsm = gating["eps_mult"]; K = gating["K"]; dm = gating["bad_margin"]; bb = gating["breakout_buffer_atr"]; tau = gating["tau"]
     w = np.array(gating["w"], dtype=float)
     # Context similarity config
@@ -20,7 +25,23 @@ def simulate_with_gates(symbol: str, features: pd.DataFrame, candidates: pd.Data
     sim_type = regime_ctx.get("sim_type", "cosine")
     gamma = float(regime_ctx.get("gamma", 1.0))
     centers_z = np.array(regime_ctx["centers_z"], dtype=float)
-    ev = events.merge(candidates[["bar_idx","side","donch_high","donch_low","atr","close"]], on="bar_idx", how="left")
+    ev = events.merge(
+        candidates[["bar_idx","side","donch_high","donch_low","atr","close"]],
+        on="bar_idx",
+        how="left",
+        suffixes=("", "_cand")
+    )
+    if "side" not in ev.columns:
+        if "side_cand" in ev.columns:
+            ev["side"] = ev["side_cand"]
+        elif "side_x" in ev.columns:
+            ev["side"] = ev["side_x"]
+        elif "side_y" in ev.columns:
+            ev["side"] = ev["side_y"]
+    for col in ("side_cand","side_x","side_y"):
+        if col in ev.columns:
+            try: ev.drop(columns=[col], inplace=True)
+            except Exception: pass
     ev["regime_id"] = regimes["regime_id"].reindex(ev["bar_idx"].values).values
     trades = []
     for _, r in ev.iterrows():
